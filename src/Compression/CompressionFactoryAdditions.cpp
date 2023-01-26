@@ -61,8 +61,9 @@ ASTPtr CompressionCodecFactory::validateCodecAndGetPreprocessedAST(
 
         bool with_compression_codec = false;
         bool with_none_codec = false;
-        bool with_floating_point_timeseries_codec = false;
-        std::optional<size_t> generic_compression_codec_pos;
+        std::optional<size_t> first_generic_compression_codec_pos;
+        std::optional<size_t> first_delta_codec_pos;
+        std::optional<size_t> last_floating_point_time_series_codec_pos;
         std::set<size_t> encryption_codecs_pos;
 
         bool can_substitute_codec_arguments = true;
@@ -139,10 +140,15 @@ ASTPtr CompressionCodecFactory::validateCodecAndGetPreprocessedAST(
 
             with_compression_codec |= result_codec->isCompression();
             with_none_codec |= result_codec->isNone();
-            with_floating_point_timeseries_codec |= result_codec->isFloatingPointTimeSeries();
 
-            if (!generic_compression_codec_pos && result_codec->isGenericCompression())
-                generic_compression_codec_pos = i;
+            if (result_codec->isGenericCompression() && !first_generic_compression_codec_pos.has_value())
+                first_generic_compression_codec_pos = i;
+
+            if (result_codec->isDeltaCompression() && !first_delta_codec_pos.has_value())
+                first_delta_codec_pos = i;
+
+            if (result_codec->isFloatingPointTimeSeriesCodec())
+                last_floating_point_time_series_codec_pos = i;
 
             if (result_codec->isEncryption())
                 encryption_codecs_pos.insert(i);
@@ -167,8 +173,7 @@ ASTPtr CompressionCodecFactory::validateCodecAndGetPreprocessedAST(
                     "(Note: you can enable setting 'allow_suspicious_codecs' to skip this check).",
                     codec_description, codec_description);
 
-            /// It does not make sense to apply any non-encryption codecs
-            /// after encryption one.
+            /// It does not make sense to apply any non-encryption codecs after encryption one.
             if (!encryption_codecs_pos.empty() &&
                 *encryption_codecs_pos.begin() != codecs_descriptions->children.size() - encryption_codecs_pos.size())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "The combination of compression codecs {} is meaningless, "
@@ -176,21 +181,30 @@ ASTPtr CompressionCodecFactory::validateCodecAndGetPreprocessedAST(
                                 "post-processing ones. (Note: you can enable setting 'allow_suspicious_codecs' "
                                 "to skip this check).", codec_description);
 
-            if (column_type)
-                if (with_floating_point_timeseries_codec && !WhichDataType(*column_type).isFloat())
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "The combination of compression codecs {} is meaningless,"
-                        " because it does not make sense to apply a floating-point time series codec to non-floating-point columns"
-                        " (Note: you can enable setting 'allow_suspicious_codecs' to skip this check).", codec_description);
+            /// Floating-point time series codecs should not be applied to non-floating-point columns
+            if (last_floating_point_time_series_codec_pos.has_value()
+                    && column_type && !WhichDataType(*column_type).isFloat())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "The combination of compression codecs {} is meaningless,"
+                    " because it does not make sense to apply a floating-point time series codec to non-floating-point columns"
+                    " (Note: you can enable setting 'allow_suspicious_codecs' to skip this check).", codec_description);
 
             /// It does not make sense to apply any transformations after generic compression algorithm
             /// So, generic compression can be only one and only at the end.
-            if (generic_compression_codec_pos &&
-                *generic_compression_codec_pos != codecs_descriptions->children.size() - 1 - encryption_codecs_pos.size())
+            if (first_generic_compression_codec_pos &&
+                *first_generic_compression_codec_pos != codecs_descriptions->children.size() - 1 - encryption_codecs_pos.size())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "The combination of compression codecs {} is meaningless, "
                                 "because it does not make sense to apply any transformations after generic "
                                 "compression algorithm. (Note: you can enable setting 'allow_suspicious_codecs' "
                                 "to skip this check).", codec_description);
+
+            /// Floating-point time series codecs usually do implicit delta compression (or something equivalent), and makes no sense to run
+            /// delta compression manually.
+            if (first_delta_codec_pos.has_value() && last_floating_point_time_series_codec_pos.has_value()
+                && (*first_delta_codec_pos < *last_floating_point_time_series_codec_pos))
+                throw Exception("The combination of compression codecs " + codec_description + " is meaningless,"
+                    " because floating point time series codecs do delta compression implicitly by themselves."
+                    " (Note: you can enable setting 'allow_suspicious_codecs' to skip this check).", ErrorCodes::BAD_ARGUMENTS);
 
         }
 
